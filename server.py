@@ -1,6 +1,8 @@
 import paho.mqtt.client as mqtt
 import re
-import subprocess
+from pymongo import MongoClient
+from datetime import datetime
+
 
 def win_condition(board):
     factor = board[0][0]*board[0][1]*board[0][2] + \
@@ -43,25 +45,61 @@ def winning_combination(board):
         return "021120"
 
 def response(player, turn):
-    global boardX, boardO, turn_count
+    global boardX, boardO, turn_count, script  # to access global variables
     i, j = int(turn[0]), int(turn[1])
-    board = globals()[f"board{player}"]
-    if not (boardX[i][j] or boardO[i][j]):
-        board[i][j] = 1
-        turn_count += 1    
-    return "turn" + turn 
+    target_board = boardX if player == "X" else boardO  # Select appropriate board
+
+    # Check if the spot is already taken
+    if not (boardX[i][j] or boardO[i][j]):  
+        target_board[i][j] = 1  # Mark the move on the player's board
+        turn_count += 1  # Increment turn counter
+        
+        # Create the script for updating the Sense HAT display
+        color = "playerX" if player == "X" else "playerO"
+        script += f"""
+set_turn({i}, {j}, {color})
+"""
+        # Send the script to RPi #2
+        display_on_RPi()  
+
+    # Always return "turn" + turn, regardless of move validity
+    return "turn" + turn
 
 
 
-def connect_displayRPi():
-    remote_host = "zumavla@displayRPi"
-    script_path = "/home/zumavla/cross-zero/connectRPi.py"
-    ssh_command = f"ssh {remote_host} 'python3 {script_path}"
-    result = subprocess.run(ssh_command, shell=True, capture_output=True, text=True)
+import subprocess
+
+def display_on_RPi():
+    global script
+    remote_host = "zumavla@displayRPi.local"
+    
+    # Define the path for the script on the remote Raspberry Pi
+    remote_script_path = "~/display.py"
+    
+    # Create the command to save the script to RPi #2
+    write_script_command = f"echo \"{script}\" > {remote_script_path}"
+    
+    # Execute the command to save the script on RPi #2
+    result = subprocess.run(f"ssh {remote_host} '{write_script_command}'", shell=True, capture_output=True, text=True)
+    
     if result.returncode == 0:
-        print(f"Message displayed successfully: {result.stdout}")
+        print(f"Script saved successfully to {remote_script_path} on RPi #2.")
+        # Now, execute the script on RPi #2
+        run_command = f"ssh {remote_host} 'python3 {remote_script_path}'"
+        result = subprocess.run(run_command, shell=True, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"Message displayed successfully: {result.stdout}")
+        else:
+            print(f"Error displaying message: {result.stderr}")
+        
+        # Optionally, remove the script after execution
+        cleanup_command = f"ssh {remote_host} 'rm {remote_script_path}'"
+        subprocess.run(cleanup_command, shell=True, capture_output=True, text=True)
     else:
-        print(f"Error displaying message: {result.stderr}")
+        print(f"Error saving script to {remote_script_path}: {result.stderr}")
+
+
 
 
 # Callback when connected to the broker
@@ -69,7 +107,7 @@ def on_connect(server, userdata, flags, rc):
     print(f"Connected with result code {rc}")
     # Subscribe to a topic
     server.subscribe("XO/server")
-    connect_displayRPi()
+    
     
 
 # Callback when a message is received
@@ -91,6 +129,7 @@ def on_message(server, userdata, msg):
                     server.publish("playerO", "opponent_found")
                     players += 1
                     active_game = True
+                    display_on_RPi()
                 elif players > 1:
                     server.publish("XO", "full")
         else:
@@ -130,12 +169,13 @@ def on_message(server, userdata, msg):
         
 
 def reset_game():
-    global active_game, players, turn_count, boardX, boardO
+    global active_game, players, turn_count, boardX, boardO, script, script0
     active_game = False
     players = 0
     turn_count = 0
     boardX = [ [0, 0, 0], [0, 0, 0], [0, 0, 0] ]
     boardO = [ [0, 0, 0], [0, 0, 0], [0, 0, 0] ]
+    script = script0
 
 
 active_game = False
@@ -143,6 +183,45 @@ players = 0
 turn_count = 0
 boardX = [ [0, 0, 0], [0, 0, 0], [0, 0, 0] ]
 boardO = [ [0, 0, 0], [0, 0, 0], [0, 0, 0] ]
+
+script0 = """
+from sense_hat import SenseHat
+sense = SenseHat()
+
+def set_turn(x, y, colour):
+    global virtual_display, flat_pixels
+    _x = 3*x 
+    _y = 3*y
+    virtual_display[_y][_x] = colour
+    virtual_display[_y + 1][_x] = colour
+    virtual_display[_y][_x + 1] = colour
+    virtual_display[_y + 1][_x + 1] = colour
+    flat_pixels = [pixel for row in virtual_display for pixel in row]
+    sense.set_pixels(flat_pixels)
+
+playerX = (0, 63, 191)
+playerO = (191, 63, 0)
+grid = (48, 48, 48)
+black = (0, 0, 0)
+flat_pixels = [black]*64   
+
+virtual_display = [[black for _ in range(8)] for _ in range(8)]
+
+# Draw horizontal lines on rows 2 and 5 (which are 3rd and 6th rows in zero-indexing)
+virtual_display[2] = [grid] * 8  # Set all pixels in row 2 to white
+virtual_display[5] = [grid] * 8  # Set all pixels in row 5 to white
+
+# Draw vertical lines on columns 2 and 5 (which are 3rd and 6th columns in zero-indexing)
+for row in virtual_display:
+    row[2] = grid  # Set pixels in column 2 to white
+    row[5] = grid  # Set pixels in column 5 to white
+    
+flat_pixels = [pixel for row in virtual_display for pixel in row] 
+
+set_turn(1, 1, black)       # depicting no colour  
+"""
+script = script0
+
 
 XOserver = mqtt.Client()              # Create an MQTT client instance
 
